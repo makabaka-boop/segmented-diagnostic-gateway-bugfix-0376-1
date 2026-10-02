@@ -629,46 +629,59 @@ func TestTCPCancelSendsStructuredError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := ServeTCP(ln, ServerConfig{Gateway: g, Clock: clock})
+	srv := ServeTCP(ln, ServerConfig{Gateway: g, Clock: clock, Tracer: tr})
 	defer srv.Close()
 
 	conn, err := net.Dial("tcp", srv.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	client := NewClient(conn)
+	defer client.Close()
 
+	type outcome struct {
+		resp ClientResponse
+		err  error
+	}
+	slow := make(chan outcome, 1)
 	go func() {
-		_, _ = SubmitClient(ctx, conn, ClientRequest{DeviceID: 1, RequestID: 321, Payload: []byte("slow")})
+		resp, err := client.Submit(ctx, ClientRequest{DeviceID: 1, RequestID: 321, Payload: []byte("slow")})
+		slow <- outcome{resp, err}
 	}()
 	<-started
 
-	// Send the cancel op and read its acknowledgment.
-	cancelHdr := make([]byte, 8)
-	cancelHdr[0], cancelHdr[1] = 'D', 'G'
-	cancelHdr[2] = OpCancel
-	cancelHdr[3] = 1
-	binaryBigEndianPutUint16(cancelHdr[4:6], 321)
-	if _, err := conn.Write(cancelHdr); err != nil {
-		t.Fatal(err)
+	// The cancel targets exactly (device 1, request 321); the request's own
+	// terminal response carries the structured canceled error.
+	if err := client.Cancel(1, 321); err != nil {
+		t.Fatalf("cancel: %v", err)
 	}
-	if _, _, err := readClientMessage(conn); err != nil {
-		t.Fatalf("cancel ack read: %v", err)
+	select {
+	case o := <-slow:
+		if o.err != nil {
+			t.Fatalf("canceled submit: %v", o.err)
+		}
+		if o.resp.Status != StatusCanceled {
+			t.Fatalf("expected canceled status, got %+v", o.resp)
+		}
+		if o.resp.DeviceID != 1 || o.resp.RequestID != 321 {
+			t.Fatalf("canceled response not attributed to its request: %+v", o.resp)
+		}
+		if o.resp.Error == nil || o.resp.Error.Code != CodeCanceled ||
+			o.resp.Error.DeviceID != 1 || o.resp.Error.RequestID != 321 {
+			t.Fatalf("missing structured canceled error: %+v", o.resp.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled request did not resolve")
 	}
 
 	// Connection stays usable: a fresh request to a healthy device succeeds.
-	resp, err := SubmitClient(ctx, conn, ClientRequest{DeviceID: 2, RequestID: 322, Payload: []byte("after-cancel")})
+	resp, err := client.Submit(ctx, ClientRequest{DeviceID: 2, RequestID: 322, Payload: []byte("after-cancel")})
 	if err != nil {
 		t.Fatalf("request after cancel: %v", err)
 	}
 	if resp.Status != StatusOK || string(resp.Payload) != "after-cancel" {
 		t.Fatalf("connection not usable after cancel: status=%d err=%v", resp.Status, resp.Error)
 	}
-}
-
-func binaryBigEndianPutUint16(b []byte, v uint16) {
-	b[0] = byte(v >> 8)
-	b[1] = byte(v)
 }
 
 func parseHexByte(s string) byte {

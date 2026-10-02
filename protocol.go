@@ -45,6 +45,8 @@ type FrameType byte
 
 func (t FrameType) String() string {
 	switch t {
+	case 0:
+		return "none" // client-facing trace events carry no device frame type
 	case TypeFirst:
 		return "first"
 	case TypeCont:

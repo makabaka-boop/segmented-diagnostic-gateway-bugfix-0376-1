@@ -105,8 +105,24 @@ TCP 客户端  ── 8 字节客户端头 + 载荷 ──►  Server (tcp.go)
 | 4-5 | 2 | 请求 ID（大端） |
 | 6-7 | 2 | 载荷长度（大端，0..512） |
 
-其后是载荷。响应头同形：第 3 字节为状态（1 OK / 2 error / 3 canceled /
-4 protocol），载荷为响应字节或 JSON 错误信封。
+其后是载荷。响应头同形：第 2 字节为状态（1 OK / 2 error / 3 canceled /
+4 protocol），**第 3、4-5 字节回显该响应所属的设备 ID 与请求 ID**，
+载荷为响应字节或 JSON 错误信封。
+
+### 连接内的归属、复用与取消
+
+- 未完成请求按 **(设备 ID, 请求 ID)** 键控：同一请求 ID 可在不同设备上
+  并行交错，同一 (设备, 请求 ID) 同时只允许一个（重复即以
+  `device_unavailable` 拒绝，不影响原请求）。
+- 请求完成后该键立即可复用（响应发出前键已释放）；取消后亦然。
+- `cancel` 只作用于该连接上完全匹配的 (设备, 请求 ID)，不会波及其他
+  设备的会话。每个请求**恰好产生一个响应**：取消在飞请求时，其最终
+  响应即以 `canceled` 状态返回（无单独 ack）；取消不在飞的键则立即
+  返回幂等的 `canceled` 确认。
+- 响应可能乱序到达。`Client`（`NewClient(conn)`）在单连接上多路复用
+  并发请求：写串行化、单读循环按响应头回显的 (设备, 请求 ID) 分派，
+  并提供 `Submit` / `Cancel` / `Close`。`SubmitClient` 只适用于连接上
+  同时至多一个未完成请求的简单场景。
 
 ## 结构化错误
 
@@ -129,7 +145,9 @@ if errors.As(err, &pe) {
 ## 帧轨迹
 
 `Tracer` 接口记录每一帧的方向、设备、请求、epoch、类型、总长度、本帧长度、
-十六进制载荷以及丢弃原因/备注：
+十六进制载荷以及丢弃原因/备注。客户端侧事件（`client->gateway` 请求/取消、
+`gateway->client` 响应）同样入轨，因此客户端结果、设备帧轨迹与结构化错误
+都能按 (设备 ID, 请求 ID) 对齐到各自请求：
 
 - `MemoryTracer`：测试用，可随时取回全部事件。
 - `LoggingTracer`：命令行运行时逐帧打印。
@@ -144,6 +162,8 @@ if errors.As(err, &pe) {
   分批返回 1/2/3/4 控制分片节奏。
 - `VirtualDeviceConfig.TransformResponse`：交换/重复/篡改响应帧，制造乱序。
 - `GatewayConfig.Dial`：可替换为自定义 `FrameTransport`（例如手写脚本）。
+- `ServerConfig.Tracer`：让 TCP 服务把客户端侧请求/取消/响应事件写入
+  与设备帧相同的轨迹。
 
 ## 测试覆盖
 
@@ -159,3 +179,9 @@ if errors.As(err, &pe) {
 | `TestOutOfOrderAndLengthMismatch` | 乱序、长度不符 |
 | `TestEmptyPayload` | 空载荷仍有 `end`，不挂起 |
 | `TestTCPClientServer` / `TestTCPCancelSendsStructuredError` | 外部 TCP 协议、超大载荷、取消后连接可复用 |
+| `TestTCPInterleavedSameRequestID` | 同连接同请求 ID 跨设备交错；乱序响应按 (设备, 请求) 归属；轨迹可对齐 |
+| `TestTCPCancelScopedToDevice` | 取消只终止目标 (设备, 请求) 会话，同 ID 的另一设备不受影响 |
+| `TestTCPRequestIDReuseAfterCompletion` | 同一 (设备, 请求 ID) 完成后立即复用 |
+| `TestTCPReuseAfterCancelIgnoresLateFrames` | 取消后复用同键，迟到帧不污染连接与后续请求 |
+| `TestTCPStructuredErrorAttribution` | 成败交错时结构化错误与成功响应各自归属 |
+| `TestTCPDuplicateSameDeviceRejected` | 同 (设备, 请求 ID) 并发去重，拒绝本身可归属 |
